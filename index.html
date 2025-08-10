@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Exoplanet Radius Gap — Contours + Zoom + Filter</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://d3js.org/d3-contour.v2.min.js"></script>
+  <style>
+    body { background: #03102a; color: #e8f7ff; font-family: Inter, Arial, sans-serif; }
+    h1 { text-align: center; margin-top: 10px; }
+    #controls { position: absolute; top: 12px; right: 12px; background: rgba(6,10,18,0.6); padding: 10px; border-radius: 6px; }
+    .tooltip { position: absolute; pointer-events: none; background: rgba(0,0,0,0.75); color: #fff; padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+    svg { display: block; margin: 14px auto; }
+    button { background:#1dd3c5; color:#03102a; border:none; padding:6px 8px; border-radius:4px; cursor:pointer; }
+    input[type=number] { width:80px; padding:4px; border-radius:4px; border: none; }
+  </style>
+</head>
+<body>
+  <h1>Exoplanet Radius Gap — Interactive</h1>
+
+  <div id="controls">
+    <div><label>Min radius: <input id="minR" type="number" step="0.1" value="0"></label></div>
+    <div style="margin-top:6px;"><label>Max radius: <input id="maxR" type="number" step="0.1" value="20"></label></div>
+    <div style="margin-top:8px;"><button id="apply">Apply filter</button> <button id="reset">Reset</button></div>
+    <div style="margin-top:8px; font-size:12px; color:#bcd;">Contours: Gaussian KDE</div>
+  </div>
+
+  <div id="viz"></div>
+  <div class="tooltip" id="tip" style="display:none;"></div>
+
+<script>
+(async function(){
+  // SVG / margins
+  const W = 1100, H = 700;
+  const margin = {top: 40, right: 40, bottom: 60, left: 80};
+  const innerW = W - margin.left - margin.right;
+  const innerH = H - margin.top - margin.bottom;
+
+  const container = d3.select('#viz');
+  const svg = container.append('svg').attr('width', W).attr('height', H);
+  // outer group
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+  // group that will be transformed by zoom (contains contours & points)
+  const plotG = g.append('g').attr('class','plotG');
+
+  // axis groups (kept separate so we can update them on zoom)
+  const xAxisG = g.append('g').attr('transform', `translate(0,${innerH})`);
+  const yAxisG = g.append('g');
+
+  // axis labels
+  g.append('text').attr('x', innerW/2).attr('y', innerH + 46).attr('text-anchor','middle').attr('fill','#cfe').text('Orbital Period (days) — log scale');
+  g.append('text').attr('transform','rotate(-90)').attr('x', -innerH/2).attr('y', -56).attr('text-anchor','middle').attr('fill','#cfe').text('Planet radius (Earth radii)');
+
+  const tooltip = d3.select('#tip');
+
+  // zoom
+  const zoom = d3.zoom()
+    .scaleExtent([0.6, 20])
+    .translateExtent([[-100,-100],[innerW+100, innerH+100]])
+    .extent([[0,0],[innerW, innerH]])
+    .on('zoom', zoomed);
+
+  svg.call(zoom);
+
+  // load data
+  let raw = await d3.json('points.json'); // expects array of {name, period, radius}
+  // sanitize & numeric
+  raw = raw.map(d => ({ name: d.name || '', period: +d.period, radius: +d.radius })).filter(d => isFinite(d.period) && isFinite(d.radius) && d.period>0 && d.radius>0);
+
+  // Scales (initial)
+  const x = d3.scaleLog().range([0, innerW]).clamp(true);
+  const y = d3.scaleLinear().range([innerH, 0]).clamp(true);
+
+  // initial domains
+  x.domain(d3.extent(raw, d => d.period));
+  y.domain([0, d3.max(raw, d => d.radius) * 1.05]);
+
+  // axis render
+  xAxisG.call(d3.axisBottom(x).ticks(7, "~g")).selectAll('text').attr('fill','#cfe');
+  yAxisG.call(d3.axisLeft(y)).selectAll('text').attr('fill','#cfe');
+
+  // color scale for contours (teal -> purple)
+  const color = d3.scaleLinear().domain([0,1]).range(['#1dd3c5','#8466ff']).interpolate(d3.interpolateLab);
+
+  // draw/update function: computes KDE contours for given dataset and draws contours & points
+  async function update(data){
+    // clear
+    plotG.selectAll('*').remove();
+
+    // grid size (tuneable)
+    const nx = 200, ny = 140;
+
+    // build grid in log(x) vs linear y
+    const logMin = d3.min(data, d => Math.log10(d.period));
+    const logMax = d3.max(data, d => Math.log10(d.period));
+    const xvals = d3.range(nx).map(i => Math.pow(10, logMin + (i/(nx-1))*(logMax-logMin)));
+    const yvals = d3.range(ny).map(i => 0 + (i/(ny-1))*(d3.max(data, d=>d.radius)));
+
+    // precompute points array in [logx, y]
+    const pts = data.map(d => [Math.log10(d.period), d.radius]);
+
+    // gaussian kernel
+    function gkernel(u){ return Math.exp(-0.5*u*u)/Math.sqrt(2*Math.PI); }
+
+    // bandwidths (try tuning)
+    const hLogX = 0.15; // in dex
+    const hY = (d3.max(data,d=>d.radius)-d3.min(data,d=>d.radius)) * 0.06 + 1e-6;
+
+    // compute density grid (row-major top->bottom; we'll not invert rows for d3.contour)
+    const grid = new Array(ny);
+    for(let j=0;j<ny;j++){
+      grid[j] = new Array(nx);
+      for(let i=0;i<nx;i++){
+        const gx = Math.log10(xvals[i]);
+        const gy = yvals[j];
+        let s = 0;
+        for(const p of pts){
+          s += gkernel((gx - p[0]) / hLogX) * gkernel((gy - p[1]) / hY);
+        }
+        grid[j][i] = s / (pts.length * hLogX * hY);
+      }
+    }
+
+    // flatten values (d3.contours expects row-major array as values)
+    const values = [].concat(...grid);
+
+    // thresholds: use quantiles of the density values
+    const thrCount = 12;
+    const sorted = values.slice().sort(d3.ascending);
+    const thresholds = d3.range(1, thrCount+1).map(k => d3.quantile(sorted, k/(thrCount+1)));
+
+    // compute contours on grid
+    const contours = d3.contours().size([nx, ny]).thresholds(thresholds)(values);
+
+    // function to convert contour polygon coordinates (grid indices) -> screen coords
+    const path = d3.geoPath();
+    function contourToPath(c){
+      // convert each MultiPolygon from grid index space to [x(period), y(radius)] coordinates
+      const transformed = { type: 'MultiPolygon', coordinates: [] };
+      c.coordinates.forEach(polyMulti => {
+        const newMulti = [];
+        polyMulti.forEach(poly => {
+          const newPoly = poly.map(pt => {
+            const gx = pt[0]; // grid x index
+            const gy = pt[1]; // grid y index
+            const logx = logMin + (gx/(nx-1))*(logMax-logMin);
+            const period = Math.pow(10, logx);
+            const radius = yvals[gy];
+            return [ x(period), y(radius) ];
+          });
+          newMulti.push(newPoly);
+        });
+        transformed.coordinates.push(newMulti);
+      });
+      return path(transformed);
+    }
+
+    // draw filled contours (lower density -> more transparent)
+    const contourLayer = plotG.append('g').attr('class','contours');
+    const minV = d3.min(thresholds), maxV = d3.max(thresholds);
+    contourLayer.selectAll('path')
+      .data(contours)
+      .enter().append('path')
+      .attr('d', d => contourToPath(d))
+      .attr('fill', d => color((d.value - minV) / (maxV - minV)))
+      .attr('stroke', 'rgba(255,255,255,0.08)')
+      .attr('stroke-width', 0.3)
+      .attr('opacity', 0.95);
+
+    // optional: top "ridge" white contours for emphasis
+    contourLayer.selectAll('path.ridge')
+      .data(contours.slice(-3)) // top few contours
+      .enter().append('path')
+      .attr('class','ridge')
+      .attr('d', d => contourToPath(d))
+      .attr('fill','none')
+      .attr('stroke','rgba(255,255,255,0.7)')
+      .attr('stroke-width', 0.6);
+
+    // draw points on top
+    const ptsLayer = plotG.append('g').attr('class','points');
+    ptsLayer.selectAll('circle')
+      .data(data)
+      .enter().append('circle')
+      .attr('cx', d => x(d.period))
+      .attr('cy', d => y(d.radius))
+      .attr('r', 3)
+      .attr('fill', 'white')
+      .attr('opacity', 0.22)
+      .on('mousemove', (event, d) => {
+        tooltip.style('display','block')
+          .html(`<strong>${d.name}</strong><br/>Period: ${d.period} d<br/>Radius: ${d.radius} R⊕`)
+          .style('left', (event.pageX + 12) + 'px')
+          .style('top', (event.pageY - 18) + 'px');
+      })
+      .on('mouseout', () => tooltip.style('display','none'));
+  }
+
+  // initial draw with all data
+  update(raw);
+
+  // zoom handler: transform plotG and rescale axes
+  function zoomed(event){
+    const t = event.transform;
+    // apply transform to plot group (contours & points)
+    plotG.attr('transform', t);
+
+    // rescale axes
+    const newX = t.rescaleX(x);
+    const newY = t.rescaleY(y);
+    xAxisG.call(d3.axisBottom(newX).ticks(7, '~g')).selectAll('text').attr('fill','#cfe');
+    yAxisG.call(d3.axisLeft(newY)).selectAll('text').attr('fill','#cfe');
+  }
+
+  // filtering controls
+  const minEl = document.getElementById('minR');
+  const maxEl = document.getElementById('maxR');
+  document.getElementById('apply').addEventListener('click', () => {
+    const minR = parseFloat(minEl.value) || 0;
+    const maxR = parseFloat(maxEl.value) || d3.max(raw, d=>d.radius);
+    const filtered = raw.filter(d => d.radius >= minR && d.radius <= maxR);
+    // update domains to fit filtered set (so contours show meaningful range)
+    if(filtered.length === 0){
+      alert('No points in that radius range.');
+      return;
+    }
+    x.domain(d3.extent(filtered, d => d.period));
+    y.domain([0, d3.max(filtered, d => d.radius) * 1.05]);
+    xAxisG.call(d3.axisBottom(x).ticks(7, '~g')).selectAll('text').attr('fill','#cfe');
+    yAxisG.call(d3.axisLeft(y)).selectAll('text').attr('fill','#cfe');
+    // reset zoom transform for clarity
+    svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
+    update(filtered);
+  });
+
+  document.getElementById('reset').addEventListener('click', () => {
+    // restore original domains
+    x.domain(d3.extent(raw, d => d.period));
+    y.domain([0, d3.max(raw, d => d.radius) * 1.05]);
+    xAxisG.call(d3.axisBottom(x).ticks(7, '~g')).selectAll('text').attr('fill','#cfe');
+    yAxisG.call(d3.axisLeft(y)).selectAll('text').attr('fill','#cfe');
+    minEl.value = 0;
+    maxEl.value = Math.ceil(d3.max(raw, d=>d.radius));
+    svg.transition().duration(300).call(zoom.transform, d3.zoomIdentity);
+    update(raw);
+  });
+
+  // small responsive touch: hide tooltip on scroll
+  window.addEventListener('scroll', () => tooltip.style('display','none'));
+})();
+</script>
+</body>
+</html>
