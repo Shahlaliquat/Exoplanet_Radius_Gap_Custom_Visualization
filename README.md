@@ -1,7 +1,7 @@
 # Exoplanet Radius Gap – Interactive D3.js Chart
-This project is a simple interactive visualization of the Exoplanet Radius Gap using D3.js.\n
+This project is a simple interactive visualization of the Exoplanet Radius Gap using D3.js.
 It shows how planets are distributed by their radius and orbital period, with interactive zooming, tooltips, and filters so you can explore the data easily.
-# # What's Inside
+## What's Inside
 index.html – The main web page with the D3.js code to display the chart.
 
 points.json – The dataset containing planet radius and orbital period information.
@@ -28,11 +28,11 @@ Filter – Show only the planets you want to explore.
 ## Why This Project Exists
 Scientists have discovered that there’s a "gap" in the sizes of small exoplanets 
 this visualization helps show that gap in an easy, interactive way for both researchers and curious people.
- ## Requirements
+## Requirements
 A modern web browser (Chrome, Firefox, Edge).
 
 Internet connection (for D3.js CDN).
 
 Optional: Python (only if you want to run data_prep.py to update the dataset).
-# # Author
+## Author
 Made by Shahla Liaquat 
